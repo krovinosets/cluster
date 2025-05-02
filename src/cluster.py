@@ -1,20 +1,27 @@
 import os
-
 import psycopg2
+from wordcloud import WordCloud
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import DBSCAN, KMeans
 from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
 import pandas as pd
+import numpy as np
 import plotly.express as px
 from kneed import KneeLocator
-import numpy as np
-from sklearn.neighbors import NearestNeighbors
-import matplotlib.pyplot as plt
-
+from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import pdist
 from src.cache import save_to_cache, is_cache_not_empty, load_from_cache
+import re
+import nltk
+from nltk.corpus import stopwords
+from pymorphy3 import MorphAnalyzer
+
+nltk.download('stopwords')
 
 
-def get_vk_posts_texts() -> list[str]:
+def get_vk_posts_texts() -> tuple[list[str], list[int]]:
     conn = psycopg2.connect(
         **{
             'dbname': os.getenv('DATABASE_NAME'),
@@ -25,22 +32,49 @@ def get_vk_posts_texts() -> list[str]:
         }
     )
     texts = []
+    group_ids = []
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT text FROM vk_posts;")
+            cursor.execute("SELECT text, group_id FROM vk_posts;")
             results = cursor.fetchall()
             texts = [row[0] for row in results]
+            group_ids = [row[-1] for row in results]
     except psycopg2.Error as e:
         print(f"Ошибка при выполнении запроса: {e}")
 
-    return texts
+    return texts, group_ids
 
 
-def make_dbscan(texts: list[str]) -> None:
-    model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
+def preprocess_texts(texts: list[str]) -> list[str]:
+    morph = MorphAnalyzer()
+    russian_stopwords = set(stopwords.words('russian') + [
+        'этот', 'это', 'весь', 'который', 'такой', 'какой', 'наш', 'свой'
+    ])
 
+    def clean_text(text: str) -> str:
+        text = re.sub(r'<[^>]+>', '', text)  # HTML-теги
+        text = re.sub(r'[^\w\s-]', '', text)  # Спецсимволы
+        text = re.sub(r'\d+', '', text)  # Цифры
+        text = text.lower().strip()  # Нормализация регистра
+
+        words = []
+        for word in text.split():
+            parsed = morph.parse(word)
+            if parsed:
+                lemma = parsed[0].normal_form
+                if lemma not in russian_stopwords and len(lemma) > 2:
+                    words.append(lemma)
+
+        return ' '.join(words)
+
+    return [clean_text(text) for text in texts if text.strip()]
+
+
+def get_vectors(texts: list[str]) -> list:
+    texts = preprocess_texts(texts)
     vectors = []
     if not is_cache_not_empty():
+        model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
         for idx, text in enumerate(texts):
             vector = model.encode(text)
             vectors.append(vector)
@@ -50,34 +84,72 @@ def make_dbscan(texts: list[str]) -> None:
     else:
         vectors = load_from_cache()
 
-    min_samples = 1536
-    # neighbors = NearestNeighbors(n_neighbors=min_samples)
-    # neighbors_fit = neighbors.fit(vectors)
-    # distances, indices = neighbors_fit.kneighbors(vectors)
-    # distances = np.sort(distances, axis=0)
-    # distances = distances[:, 1]
-    # plt.plot(distances)
-    # plt.xlabel('Points sorted by distance')
-    # plt.ylabel(f'{min_samples}-NN distance')
-    # plt.show()
-    #
-    # knee_index = 3700  # примерная позиция изгиба
-    # eps = distances[knee_index]
-    # print(eps)
+    return vectors
 
-    # labels, n_clusters = dbscan_clustering(vectors)
-    # print(n_clusters)
-    #
-    # # # Кластеризация DBSCAN
-    # # clustering = DBSCAN(eps=2.00, min_samples=min_samples).fit(vectors)
-    # # labels = clustering.labels_
-    #
-    # make_2d_plot(vectors, texts, labels)
 
-    num = number_of_clusters(vectors)
-    labels, centers = kmeans_clustering(vectors, num)
-    make_2d_plot(vectors, texts, labels)
-    make_3d_plot(vectors, texts, labels)
+def get_cluster_keywords(texts, labels, top_n=10, max_features=5000):
+    clustered_texts = {}
+    for text, label in zip(texts, labels):
+        clustered_texts.setdefault(label, []).append(text)
+
+    cluster_keywords = {}
+    for label, docs in clustered_texts.items():
+        vectorizer = TfidfVectorizer(
+            max_features=max_features,
+            token_pattern=r'(?u)\b[a-zA-Zа-яА-ЯёЁ]{3,}\b'
+        )
+
+        tfidf_matrix = vectorizer.fit_transform(docs)
+        feature_names = vectorizer.get_feature_names_out()
+
+        scores = tfidf_matrix.sum(axis=0).A1
+        top_indices = scores.argsort()[-top_n:][::-1]
+
+        keywords = [feature_names[i] for i in top_indices]
+        cluster_keywords[label] = keywords
+
+        word_freq = {feature_names[i]: scores[i] for i in top_indices}
+        wc = WordCloud(
+            font_path='arial'
+        ).generate_from_frequencies(word_freq)
+
+        plt.figure(figsize=(10, 5))
+        plt.imshow(wc, interpolation='bilinear')
+        plt.title(f'Кластер {label} ({len(docs)} документов)')
+        plt.axis('off')
+        plt.show()
+
+
+def hierarchical_clustering(vectors, n_clusters=2, method='ward', metric='euclidean'):
+    """
+    Выполняет иерархическую кластеризацию для массива векторов
+
+    Параметры:
+    vectors (list/np.array): Массив векторов формы (n_samples, n_features)
+    n_clusters (int): Количество желаемых кластеров
+    method (str): Метод связывания ('ward', 'complete', 'average', 'single')
+    metric (str): Метрика расстояния ('euclidean', 'cosine', 'cityblock' и др.)
+
+    Возвращает:
+    np.array: Массив меток кластеров формы (n_samples,)
+    """
+    # Преобразование в numpy array
+    X = np.array(vectors)
+
+    # Проверка размерности данных
+    if X.ndim != 2:
+        raise ValueError("Input data must be 2-dimensional array (n_samples, n_features)")
+
+    # Вычисление попарных расстояний
+    distance_matrix = pdist(X, metric=metric)
+
+    # Построение иерархии кластеров
+    Z = linkage(distance_matrix, method=method)
+
+    # Формирование кластеров
+    labels = fcluster(Z, t=n_clusters, criterion='maxclust')
+
+    return labels
 
 
 def number_of_clusters(vectors):
@@ -93,23 +165,28 @@ def number_of_clusters(vectors):
         curve='convex',
         direction='decreasing'
     )
-    optimal_k = kl.elbow
-    return optimal_k
+    return kl.elbow
 
 
-def kmeans_clustering(vectors, n_clusters):
-    """
-    Кластеризация 768-мерных векторов методом K-means
+def kmeans_clustering(vectors, n_clusters, group_ids):
+    vectors = np.asarray(vectors)
+    group_ids = np.asarray(group_ids)
 
-    Параметры:
-        vectors : np.array - массив векторов формы (n_samples, 768)
-        n_clusters : int - количество кластеров
-
-    Возвращает:
-        tuple (метки кластеров, центроиды кластеров)
-    """
     kmeans = KMeans(n_clusters=n_clusters, n_init='auto').fit(vectors)
-    return kmeans.labels_, kmeans.cluster_centers_
+    labels = kmeans.labels_
+    adjusted_labels = np.copy(labels)
+
+    for cluster in np.unique(labels):
+        cluster_mask = (labels == cluster)
+        cluster_groups = group_ids[cluster_mask]
+
+        unique_groups, counts = np.unique(cluster_groups, return_counts=True)
+        predominant_group = unique_groups[np.argmax(counts)]
+
+        non_predominant_mask = cluster_mask & (group_ids != predominant_group)
+        adjusted_labels[non_predominant_mask] = -1
+
+    return adjusted_labels, kmeans.cluster_centers_
 
 
 def dbscan_clustering(vectors, eps=2.00, min_samples=768):
@@ -130,24 +207,23 @@ def dbscan_clustering(vectors, eps=2.00, min_samples=768):
     return labels, n_clusters
 
 
-def make_3d_plot(vectors, texts, labels):
+def make_3d_plot(vectors, texts, labels, group_ids):
     pca = PCA(n_components=3)
     vectors_3d = pca.fit_transform(vectors)
 
-    # Создание DataFrame для визуализации
     df = pd.DataFrame({
         'text': [text[:150] for text in texts],
         'cluster': labels,
+        'group id': group_ids,
         'x': vectors_3d[:, 0],
         'y': vectors_3d[:, 1],
         'z': vectors_3d[:, 2]
     })
 
-    # Интерактивная 3D визуализация
     fig = px.scatter_3d(df,
                         x='x', y='y', z='z',
                         color='cluster',
-                        hover_data=['text'],
+                        hover_data=['text', 'group id'],
                         title='3D Визуализация кластеров',
                         labels={'cluster': 'Кластер'},
                         color_continuous_scale=px.colors.sequential.Viridis)
@@ -163,24 +239,23 @@ def make_3d_plot(vectors, texts, labels):
     fig.show()
 
 
-def make_2d_plot(vectors, texts, labels):
+def make_2d_plot(vectors, texts, labels, group_ids):
     pca = PCA(n_components=2)
     vectors_2d = pca.fit_transform(vectors)
 
-    # Создание DataFrame
     df_2d = pd.DataFrame({
         'text': [text[:150] for text in texts],
         'cluster': labels,
+        'group id': group_ids,
         'x': vectors_2d[:, 0],
         'y': vectors_2d[:, 1]
     })
 
-    # Интерактивная 2D визуализация
     fig = px.scatter(df_2d,
                      x='x',
                      y='y',
                      color='cluster',
-                     hover_data=['text'],
+                     hover_data=['text', 'group id'],
                      title='2D Визуализация кластеров',
                      labels={'cluster': 'Кластер'},
                      color_continuous_scale=px.colors.sequential.Viridis)

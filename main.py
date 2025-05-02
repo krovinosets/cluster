@@ -4,8 +4,8 @@ from argparse import ArgumentParser
 from dotenv import load_dotenv
 
 from src.parser import Parser
-from src.cluster import get_vk_posts_texts, make_dbscan
-
+from src.cluster import get_vk_posts_texts, get_vectors, number_of_clusters, kmeans_clustering, \
+    get_cluster_keywords, make_2d_plot, make_3d_plot
 
 load_dotenv()
 
@@ -44,5 +44,10 @@ if __name__ == '__main__':
             )
             vk_parser.save_to_db(posts)
         case "cluster":
-            texts: list[str] = get_vk_posts_texts()
-            make_dbscan(texts)
+            texts, group_ids = get_vk_posts_texts()
+            vectors = get_vectors(texts)
+            num = number_of_clusters(vectors)
+            labels, centers = kmeans_clustering(vectors, num, group_ids)
+            get_cluster_keywords(texts, labels)
+            make_2d_plot(vectors, texts, labels, group_ids)
+            make_3d_plot(vectors, texts, labels, group_ids)

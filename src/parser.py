@@ -54,8 +54,8 @@ class Parser:
                     continue
                 cursor.execute("""
                     INSERT INTO vk_posts 
-                    (post_id, text, date, likes, reposts, views)
-                    VALUES (%s, %s, to_timestamp(%s), %s, %s, %s)
+                    (post_id, text, date, likes, reposts, views, group_id)
+                    VALUES (%s, %s, to_timestamp(%s), %s, %s, %s, %s)
                     ON CONFLICT (post_id) DO NOTHING
                 """, (
                     post['id'],
@@ -63,7 +63,8 @@ class Parser:
                     post['date'],
                     post['likes']['count'],
                     post['reposts']['count'],
-                    post['views']['count']
+                    post['views']['count'],
+                    os.getenv("VK_GROUP_ID")
                 ))
             conn.commit()
         except Exception as e:
